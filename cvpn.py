@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 
-tag_description = 'game_match'
-region_name = 'eu-central-1'
 vpc_cidr = '192.168.8.0/24'
 
-whitelist_ipv4 = '1.2.3.4/32'
-whitelist_ipv6 = '1abc:2abc:3abc:4abc:5abc:6abc:7abc:8abc/128'
-
-import boto3, urllib3, uuid, sys, argparse, cryptography, warnings, time
+import boto3, urllib3, uuid, sys, argparse, warnings, time, socket, paramiko, ipaddress
 from botocore.config import Config
 
 argparser = argparse.ArgumentParser(prog=sys.argv[0], description='On demand VPN in the cloud')
 argparser.add_argument('--proxy', type=str, default=None, required=False, help='configures HTTPS proxy to use, e.g. https://127.0.0.1:8080 or None')
 argparser.add_argument('--validate', type=bool, default=True, required=False, help='validate server certificate')
 argparser.add_argument('--cleanup_id', type=str, default=None, required=False, help='perform cleanup for the given ID')
+argparser.add_argument('--region_name', type=str, default='eu-central-1', required=False, help='region name')
+argparser.add_argument('--tag_description', type=str, default='game_match', required=False, help='description to use in tags')
+argparser.add_argument('--whitelist_ipv4', type=str, nargs='+', default=[], required=False, help='IPv4 addresses to whitelist for access (in CIDR notation)')
+argparser.add_argument('--whitelist_ipv6', type=str, nargs='+', default=[], required=False, help='IPv6 addresses to whitelist for access (in CIDR notation)')
 args = argparser.parse_args()
 
 create = False
@@ -28,10 +27,10 @@ else:
     cleanup_id = args.cleanup_id
 
 if args.proxy == None:
-    config = Config(region_name=region_name)
+    config = Config(region_name=args.region_name)
     print('Not using HTTPS proxy.')
 else:
-    config = Config(region_name=region_name, proxies = {'https': args.proxy})
+    config = Config(region_name=args.region_name, proxies = {'https': args.proxy})
     print('Using HTTPS proxy:', args.proxy)
 
 if args.validate == True:
@@ -44,10 +43,14 @@ ec2 = boto3.resource('ec2', verify=args.validate, config=config)
 ec2c = boto3.client('ec2', verify=args.validate, config=config)
 
 try:
-    if create == True:    
+    if create == True:
+        if len(args.whitelist_ipv4) == 0 and len(args.whitelist_ipv6) == 0:
+            print('Cannot setup the instance without any IP address whitelisted. Exiting.')
+            exit(1)
+
         vpc = ec2.create_vpc(CidrBlock=vpc_cidr, AmazonProvidedIpv6CidrBlock=True)
         vpc.create_tags(Tags=[
-            {'Key': 'Name', 'Value': 'VPC_' + tag_description},
+            {'Key': 'Name', 'Value': 'VPC_' + args.tag_description},
             {'Key': 'CleanupId', 'Value': cleanup_id}])
         vpc.wait_until_available()
         print('Created VPC:', vpc.id)
@@ -55,7 +58,7 @@ try:
         ig = ec2.create_internet_gateway()
         ig.attach_to_vpc(VpcId=vpc.id)
         ig.create_tags(Tags=[
-            {'Key': 'Name', 'Value': 'IGW_' + tag_description},
+            {'Key': 'Name', 'Value': 'IGW_' + args.tag_description},
             {'Key': 'CleanupId', 'Value': cleanup_id}])
         print('Created Internet Gateway:', ig.id)
 
@@ -63,7 +66,7 @@ try:
         rt.create_route(DestinationCidrBlock='0.0.0.0/0', GatewayId=ig.id)
         rt.create_route(DestinationIpv6CidrBlock='::/0', GatewayId=ig.id)
         rt.create_tags(Tags=[
-            {'Key': 'Name', 'Value': 'RT_' + tag_description},
+            {'Key': 'Name', 'Value': 'RT_' + args.tag_description},
             {'Key': 'CleanupId', 'Value': cleanup_id}])
         print('Created route table:', rt.id)
 
@@ -72,25 +75,43 @@ try:
             Ipv6CidrBlock=(vpc.ipv6_cidr_block_association_set[0]['Ipv6CidrBlock'])[:-2] + '64',
             VpcId=vpc.id)
         sn.create_tags(Tags=[
-            {'Key': 'Name', 'Value': 'SN_' + tag_description},
+            {'Key': 'Name', 'Value': 'SN_' + args.tag_description},
             {'Key': 'CleanupId', 'Value': cleanup_id}])
         print('Created subnet:', sn.id)
         rt.associate_with_subnet(SubnetId=sn.id)
 
-        sg = ec2.create_security_group(GroupName='SG_' + tag_description, Description='Allowed traffic (in)', VpcId=vpc.id)
+        sg = ec2.create_security_group(GroupName='SG_' + args.tag_description, Description='Allowed traffic (in)', VpcId=vpc.id)
         sg.create_tags(Tags=[
-            {'Key': 'Name', 'Value': 'SG_' + tag_description},
+            {'Key': 'Name', 'Value': 'SG_' + args.tag_description},
             {'Key': 'CleanupId', 'Value': cleanup_id}])
-        sg.authorize_ingress(IpProtocol='tcp', FromPort=22, ToPort=22, CidrIp=whitelist_ipv4)
-        sg.authorize_ingress(IpPermissions=[{
-            'IpProtocol': 'tcp',
-            'FromPort': 22,
-            'ToPort': 22,
-            'Ipv6Ranges': [{'CidrIpv6': whitelist_ipv6}]
-        }])
+        for ipv4 in args.whitelist_ipv4:
+            print('Whitelisting IPv4 address', ipv4)
+            sg.authorize_ingress(IpProtocol='tcp', FromPort=22, ToPort=22, CidrIp=ipv4)
+            sg.authorize_ingress(IpProtocol='tcp', FromPort=1723, ToPort=1723, CidrIp=ipv4)
+            # GRE
+            sg.authorize_ingress(IpProtocol='47', CidrIp=ipv4)
+        for ipv6 in args.whitelist_ipv6:
+            print('Whitelisting IPv6 address', ipv6)
+            sg.authorize_ingress(IpPermissions=[{
+                'IpProtocol': 'tcp',
+                'FromPort': 22,
+                'ToPort': 22,
+                'Ipv6Ranges': [{'CidrIpv6': ipv6}]
+            }])
+            sg.authorize_ingress(IpPermissions=[{
+                'IpProtocol': 'tcp',
+                'FromPort': 1723,
+                'ToPort': 1723,
+                'Ipv6Ranges': [{'CidrIpv6': ipv6}]
+            }])
+            # GRE
+            sg.authorize_ingress(IpPermissions=[{
+                'IpProtocol': '47',
+                'Ipv6Ranges': [{'CidrIpv6': ipv6}]
+            }])
         print('Created security group:', sg.id)
 
-        keyname = 'K_' + tag_description + '_' + cleanup_id
+        keyname = 'K_' + args.tag_description + '_' + cleanup_id
         key = ec2.create_key_pair(KeyName=keyname)
         print('Created SSH PEM key:', keyname)
         with open(keyname, 'w') as keyfile:
@@ -111,10 +132,55 @@ try:
                 'Groups': [sg.group_id]
             }])
         instances[0].create_tags(Tags=[
-            {'Key': 'Name', 'Value': 'vpn_' + tag_description},
+            {'Key': 'Name', 'Value': 'vpn_' + args.tag_description},
             {'Key': 'CleanupId', 'Value': cleanup_id}])
         instances[0].wait_until_running()
-        print('Instance ' + 'vpn_' + tag_description + ' created and running: ' + instances[0].id)
+        print('Instance ' + 'vpn_' + args.tag_description + ' created and running: ' + instances[0].id)
+
+        public_ip_address = str(instances[0].public_ip_address)
+        private_ip_address = str(instances[0].private_ip_address)
+
+        print('Connecting to', public_ip_address, 'on port 22 for SFTP...')
+        while True:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.connect((public_ip_address, 22))
+                break
+            except ConnectionRefusedError:
+                print('Connection to the instance refused, retrying in 2 seconds...')
+                time.sleep(2)
+            except TimeoutError:
+                print('Connection to the instance timed out, retrying in 2 seconds...')
+                time.sleep(2)
+        ssh = paramiko.Transport(sock)
+        pkey = paramiko.RSAKey.from_private_key_file(keyname)
+        ssh.connect(username='ubuntu', pkey=pkey)
+        if ssh.is_authenticated():
+            print('SFTP connection established.')
+        else:
+            print('Could not authenticated with the provided key. Exiting.')
+            exit(1)
+        sftp = paramiko.SFTPClient.from_transport(ssh)
+        sftp.put('setup.sh','setup.sh')
+        if sftp:
+            sftp.close()
+        if ssh:
+            ssh.close()
+
+        print('Executing the setup script...')
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(hostname=public_ip_address, username='ubuntu', key_filename=keyname)
+        ssh.invoke_shell()
+        stdin, stdout, stderr = ssh.exec_command('chmod a+x ./setup.sh && sudo ./setup.sh ' +
+            public_ip_address + ' ' + private_ip_address)
+        while not stdout.channel.exit_status_ready() and not stdout.channel.recv_ready():
+            time.sleep(2)
+        for line in stdout.readlines():
+            print(line)
+        for line in stderr.readlines():
+            print(line)
+        ssh.close()
     else:
         filters = [{'Name': 'tag:CleanupId', 'Values': [cleanup_id]}]
 
