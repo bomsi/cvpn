@@ -2,17 +2,55 @@
 
 vpc_cidr = '192.168.8.0/24'
 
-import boto3, urllib3, uuid, sys, argparse, warnings, time, socket, paramiko, ipaddress
+import boto3, urllib3, uuid, sys, argparse, warnings, time, socket, paramiko, ipaddress, os
 from botocore.config import Config
+
+def ipv4cidr(string):
+    try:
+        ipv4net = ipaddress.IPv4Network(string)
+    except:
+        raise argparse.ArgumentTypeError("%r is not a valid IPv4 network" % string)
+    return ipv4net
+
+def ipv6cidr(string):
+    try:
+        ipv6net = ipaddress.IPv6Network(string)
+    except:
+        raise argparse.ArgumentTypeError("%r is not a valid IPv6 network" % string)
+    return ipv6net
+
+def awsregion(string):
+    if string not in [
+            'us-east-2', # US East (Ohio)
+            'us-east-1', # US East (N. Virginia)
+            'us-west-1', # US West (N. California)
+            'us-west-2', # US West (Oregon)
+            'ap-east-1', # Asia Pacific (Hong Kong)
+            'ap-south-1', # Asia Pacific (Mumbai)
+            'ap-northeast-3', # Asia Pacific (Osaka-Local)
+            'ap-northeast-2', # Asia Pacific (Seoul)
+            'ap-southeast-1', # Asia Pacific (Singapore)
+            'ap-southeast-2', # Asia Pacific (Sydney)
+            'ap-northeast-1', # Asia Pacific (Tokyo)
+            'ca-central-1', # Canada (Central)
+            'eu-central-1', # Europe (Frankfurt)
+            'eu-west-1', # Europe (Ireland)
+            'eu-west-2', # Europe (London)
+            'eu-west-3', # Europe (Paris)
+            'eu-north-1', # Europe (Stockholm)
+            'me-south-1', # Middle East (Bahrain)
+            'sa-east-1']: # South America (São Paulo)
+        raise argparse.ArgumentTypeError("%r is not a valid AWS region" % string)
+    return string
 
 argparser = argparse.ArgumentParser(prog=sys.argv[0], description='On demand VPN in the cloud')
 argparser.add_argument('--proxy', type=str, default=None, required=False, help='configures HTTPS proxy to use, e.g. https://127.0.0.1:8080 or None')
 argparser.add_argument('--validate', type=bool, default=True, required=False, help='validate server certificate')
 argparser.add_argument('--cleanup_id', type=str, default=None, required=False, help='perform cleanup for the given ID')
-argparser.add_argument('--region_name', type=str, default='eu-central-1', required=False, help='region name')
+argparser.add_argument('--region_name', type=awsregion, default='eu-central-1', required=False, help='region name')
 argparser.add_argument('--tag_description', type=str, default='game_match', required=False, help='description to use in tags')
-argparser.add_argument('--whitelist_ipv4', type=str, nargs='+', default=[], required=False, help='IPv4 addresses to whitelist for access (in CIDR notation)')
-argparser.add_argument('--whitelist_ipv6', type=str, nargs='+', default=[], required=False, help='IPv6 addresses to whitelist for access (in CIDR notation)')
+argparser.add_argument('--whitelist_ipv4', type=ipv4cidr, action='append', default=[], required=False, help='IPv4 addresses to whitelist for access (in CIDR notation)')
+argparser.add_argument('--whitelist_ipv6', type=ipv6cidr, action='append', default=[], required=False, help='IPv6 addresses to whitelist for access (in CIDR notation)')
 args = argparser.parse_args()
 
 create = False
@@ -47,6 +85,20 @@ try:
         if len(args.whitelist_ipv4) == 0 and len(args.whitelist_ipv6) == 0:
             print('Cannot setup the instance without any IP address whitelisted. Exiting.')
             exit(1)
+
+        amis = ec2c.describe_images(
+                Owners=['379101102735'], # Debian official account
+                Filters=[{'Name': 'architecture', 'Values': ['x86_64']}])
+        for ami in amis['Images']:
+            candidate_ami = (ami['ImageId'], ami['CreationDate'], ami['Name'])
+            if 'selected_ami' not in globals():
+                selected_ami = candidate_ami
+            if candidate_ami[1] > selected_ami[1]:
+                selected_ami = candidate_ami
+        if 'selected_ami' not in globals():
+            print('Could not find the AMI for latest Debian. Exiting.')
+            exit(1)
+        print('AMI selected for provisioning: ' + selected_ami[0] + ' (' + selected_ami[2] + ')')
 
         vpc = ec2.create_vpc(CidrBlock=vpc_cidr, AmazonProvidedIpv6CidrBlock=True)
         vpc.create_tags(Tags=[
@@ -86,40 +138,33 @@ try:
             {'Key': 'CleanupId', 'Value': cleanup_id}])
         for ipv4 in args.whitelist_ipv4:
             print('Whitelisting IPv4 address', ipv4)
-            sg.authorize_ingress(IpProtocol='tcp', FromPort=22, ToPort=22, CidrIp=ipv4)
-            sg.authorize_ingress(IpProtocol='tcp', FromPort=1723, ToPort=1723, CidrIp=ipv4)
-            # GRE
-            sg.authorize_ingress(IpProtocol='47', CidrIp=ipv4)
+            sg.authorize_ingress(IpProtocol='tcp', FromPort=22, ToPort=22, CidrIp=str(ipv4))
+            sg.authorize_ingress(IpProtocol='udp', FromPort=53, ToPort=53, CidrIp=str(ipv4))
         for ipv6 in args.whitelist_ipv6:
             print('Whitelisting IPv6 address', ipv6)
             sg.authorize_ingress(IpPermissions=[{
                 'IpProtocol': 'tcp',
                 'FromPort': 22,
                 'ToPort': 22,
-                'Ipv6Ranges': [{'CidrIpv6': ipv6}]
+                'Ipv6Ranges': [{'CidrIpv6': str(ipv6)}]
             }])
             sg.authorize_ingress(IpPermissions=[{
-                'IpProtocol': 'tcp',
-                'FromPort': 1723,
-                'ToPort': 1723,
-                'Ipv6Ranges': [{'CidrIpv6': ipv6}]
+                'IpProtocol': 'udp',
+                'FromPort': 53,
+                'ToPort': 53,
+                'Ipv6Ranges': [{'CidrIpv6': str(ipv6)}]
             }])
-            # GRE
-            sg.authorize_ingress(IpPermissions=[{
-                'IpProtocol': '47',
-                'Ipv6Ranges': [{'CidrIpv6': ipv6}]
-            }])
-        print('Created security group:', sg.id)
+        print('Created Security Group:', sg.id)
 
         keyname = 'K_' + args.tag_description + '_' + cleanup_id
         key = ec2.create_key_pair(KeyName=keyname)
         print('Created SSH PEM key:', keyname)
         with open(keyname, 'w') as keyfile:
             keyfile.write(str(key.key_material))
+        os.chmod(keyname, 0o600)
 
-        # Ubuntu Server 18.04 LTS (HVM), SSD Volume Type - ami-0cc0a36f626a4fdf5 (64-bit x86)
         print('Creating instance...')
-        instances = ec2.create_instances(ImageId='ami-0cc0a36f626a4fdf5',
+        instances = ec2.create_instances(ImageId=selected_ami[0],
             InstanceType='t2.micro',
             MaxCount=1,
             MinCount=1,
@@ -154,11 +199,11 @@ try:
                 time.sleep(2)
         ssh = paramiko.Transport(sock)
         pkey = paramiko.RSAKey.from_private_key_file(keyname)
-        ssh.connect(username='ubuntu', pkey=pkey)
+        ssh.connect(username='admin', pkey=pkey)
         if ssh.is_authenticated():
             print('SFTP connection established.')
         else:
-            print('Could not authenticated with the provided key. Exiting.')
+            print('Could not authenticate with the provided key. Exiting.')
             exit(1)
         sftp = paramiko.SFTPClient.from_transport(ssh)
         sftp.put('setup.sh','setup.sh')
@@ -167,20 +212,8 @@ try:
         if ssh:
             ssh.close()
 
-        print('Executing the setup script...')
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(hostname=public_ip_address, username='ubuntu', key_filename=keyname)
-        ssh.invoke_shell()
-        stdin, stdout, stderr = ssh.exec_command('chmod a+x ./setup.sh && sudo ./setup.sh ' +
-            public_ip_address + ' ' + private_ip_address)
-        while not stdout.channel.exit_status_ready() and not stdout.channel.recv_ready():
-            time.sleep(2)
-        for line in stdout.readlines():
-            print(line)
-        for line in stderr.readlines():
-            print(line)
-        ssh.close()
+        print('Provisioning complete. Execute setup.sh after logging in with:')
+        print('ssh -i ' + keyname + ' admin@' + public_ip_address)
     else:
         filters = [{'Name': 'tag:CleanupId', 'Values': [cleanup_id]}]
 
@@ -192,7 +225,7 @@ try:
         sgs = []
         for sg in list(ec2.security_groups.filter(Filters=filters)):
             sgs.append(sg.id)
-            print('Security group to delete:', sg.id, '(', sg.group_name, ')')
+            print('Security Group to delete:', sg.id, '(', sg.group_name, ')')
 
         sns = []
         for sn in list(ec2.subnets.filter(Filters=filters)):
@@ -207,7 +240,7 @@ try:
         igs = []
         for ig in list(ec2.internet_gateways.filter(Filters=filters)):
             igs.append(ig.id)
-            print('Internet gateway to delete:', ig.id)
+            print('Internet Gateway to delete:', ig.id)
         
         vpcs = []
         for vpc in list(ec2.vpcs.filter(Filters=filters)):
@@ -252,15 +285,15 @@ try:
                     {'Name': 'tag:CleanupId', 'Values': [cleanup_id]},
                     {'Name': 'attachment.vpc-id', 'Values': [vpc]}])
                 for ig in attached:
-                    print('Detaching internet gateway:', ig.id, 'from VPC:', vpc)
+                    print('Detaching Internet Gateway:', ig.id, 'from VPC:', vpc)
                     ec2c.detach_internet_gateway(InternetGatewayId=ig.id, VpcId=vpc)
             
             for ig in igs:
-                print('Deleting internet gateway:', ig)
+                print('Deleting Internet Gateway:', ig)
                 ec2c.delete_internet_gateway(InternetGatewayId=ig)
 
             for sg in sgs:
-                print('Deleting security group', sg)
+                print('Deleting Security Group', sg)
                 ec2c.delete_security_group(GroupId=sg)
 
             for vpc in vpcs:
@@ -272,3 +305,5 @@ try:
 except:
     extype, exvalue, extrace = sys.exc_info()
     print('An error has occured: %s %s %s' % (extype, exvalue, extrace))
+
+

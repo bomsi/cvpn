@@ -1,56 +1,46 @@
 #!/bin/sh
-echo "public_ip_address=$1"
-echo "private_ip_address=$2"
 
-apt-get clean && apt-get update && apt-get install -y pptpd
-
-modprobe ppp-compress-18 && echo "ppp-compress-18 ok"
-modprobe nf_conntrack_proto_gre && echo "nf_conntrack_proto_gre ok"
-modprobe nf_conntrack_pptp && echo "nf_conntrack_pptp ok"
-
-from=$(echo "$2" | cut -d . -f 4)
-if [ "$from" -ge "128" ]; then
-    from=50
-    to=70
-else
-    from=200
-    to=220
+if [ "$(id -u)" -ne 0 ]; then
+	echo "Please run this script as root" >&2
+	exit 1
 fi
 
-echo "" >>/etc/pptpd.conf
-echo "localip $2" >>/etc/pptpd.conf
-echo "remoteip 192.168.8.$from-$to" >>/etc/pptpd.conf
+echo "deb http://deb.debian.org/debian/ unstable main" > /etc/apt/sources.list.d/unstable.list
+printf 'Package: *\nPin: release a=unstable\nPin-Priority: 90\n' > /etc/apt/preferences.d/limit-unstable
+apt-get update
+apt-get install wireguard
 
-echo "" >>/etc/ppp/pptpd-options
-echo "ms-dns 8.8.8.8" >>/etc/ppp/pptpd-options
-echo "ms-dns 8.8.4.4" >>/etc/ppp/pptpd-options
+# add the interface
+ip link add dev wg0 type wireguard
 
-echo "" >>/etc/ppp/chap-secrets
-echo "user1 pptpd password1 *" >>/etc/ppp/chap-secrets
-echo "user2 pptpd password2 *" >>/etc/ppp/chap-secrets
-echo "user3 pptpd password3 *" >>/etc/ppp/chap-secrets
-echo "user4 pptpd password4 *" >>/etc/ppp/chap-secrets
-echo "user5 pptpd password5 *" >>/etc/ppp/chap-secrets
+# assign IPv4 address
+ip address add dev wg0 10.11.12.1/24
 
-sysctl net.ipv4.ip_forward=1
+# generate private and public key for the node
+cd /etc/wireguard/
+umask 077
+wg genkey | tee private.key | wg pubkey > public.key
 
-ufw disable
+wg set wg0 listen-port 53 private-key /etc/wireguard/private.key
 
-iptables -P INPUT ACCEPT
-iptables -P FORWARD ACCEPT
-iptables -F
-iptables -Z
+ip link set up dev wg0
 
-iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-iptables -A INPUT -i lo -j ACCEPT
-iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-iptables -A INPUT -p tcp --dport 1723 -j ACCEPT
-iptables -A INPUT -p gre -j ACCEPT
+wg
 
-iptables -t nat -A POSTROUTING -s 192.168.0.0/24 -j SNAT --to "$1"
+# on the other peer, run the following:
+#  ip link add dev wg0 type wireguard
+#  ip address add dev wg0 10.11.12.2/24
+#  cd /etc/wireguard/
+#  umask 077
+#  wg genkey | tee private.key | wg pubkey > public.key
+#  wg set wg0 listen-port 50001 private-key /etc/wireguard/private.key
+#  ip link set up dev wg0
+# share the public keys, and add the peer with the public IP on the "client":
+#  wg set wg0 peer base64publickeyserver allowed-ips 10.11.12.1/24 endpoint 1.2.3.4:53
+# add the "client" peer on the endpoint with public IP:
+#  wg set wg0 peer base64publickeyclient allowed-ips 10.11.12.2/24
 
-iptables -A INPUT -j DROP
-
-/etc/init.d/pptpd restart
-
-echo "Done."
+# on the AWS side, compare
+#  tcpdump -A -i eth0 port not ssh
+# with
+#  tcpdump -A -i wg0
