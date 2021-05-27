@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/bash
 
 if [ "$(id -u)" -ne 0 ]; then
 	echo "Please run this script as root" >&2
@@ -10,20 +10,21 @@ printf 'Package: *\nPin: release a=unstable\nPin-Priority: 90\n' > /etc/apt/pref
 apt-get update
 apt-get install wireguard
 
-# add the interface
-ip link add dev wg0 type wireguard
-
-# assign IPv4 address
-ip address add dev wg0 10.11.12.1/24
-
 # generate private and public key for the node
 cd /etc/wireguard/
 umask 077
 wg genkey | tee private.key | wg pubkey > public.key
 
-wg set wg0 listen-port 53 private-key /etc/wireguard/private.key
+# server config
+cat >wg0.conf << EOF
+[Interface]
+PrivateKey = $(cat private.key)
+ListenPort = 53
+Address = 10.11.12.1/24
+EOF
 
-ip link set up dev wg0
+# start the interface
+wg-quick up wg0
 
 wg
 
