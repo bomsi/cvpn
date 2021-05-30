@@ -23,6 +23,12 @@ ListenPort = 53
 Address = 10.11.12.1/24
 EOF
 
+# if you would like to allow clients to use the server as exit:
+# * edit /etc/sysctl.conf, and set net.ipv4.ip_forward=1
+# * sysctl -p
+# * iptables -t nat -A POSTROUTING -s 10.11.12.0/24 -o ens3 -j MASQUERADE
+# in that case, clients need to have "AllowedIPs = 0.0.0.0/0, ::/0" in their conf
+
 # start the interface
 wg-quick up wg0
 
