@@ -15,7 +15,7 @@ cd /etc/wireguard/
 umask 077
 wg genkey | tee private.key | wg pubkey > public.key
 
-# server config
+# "server" config
 cat >wg0.conf << EOF
 [Interface]
 PrivateKey = $(cat private.key)
@@ -28,24 +28,38 @@ EOF
 # * sysctl -p
 # * iptables -t nat -A POSTROUTING -s 10.11.12.0/24 -o ens3 -j MASQUERADE
 # in that case, clients need to have "AllowedIPs = 0.0.0.0/0, ::/0" in their conf
+# otherwise, set "AllowedIPs = 10.11.12.1/24" in their conf
 
 # start the interface
 wg-quick up wg0
 
 wg
 
-# on the other peer, run the following:
-#  ip link add dev wg0 type wireguard
-#  ip address add dev wg0 10.11.12.2/24
+# on the other peer ("client"), run the following:
 #  cd /etc/wireguard/
 #  umask 077
 #  wg genkey | tee private.key | wg pubkey > public.key
-#  wg set wg0 listen-port 50001 private-key /etc/wireguard/private.key
-#  ip link set up dev wg0
-# share the public keys, and add the peer with the public IP on the "client":
-#  wg set wg0 peer base64publickeyserver allowed-ips 10.11.12.1/24 endpoint 1.2.3.4:53
+#  echo "base64serverpublickey" > server-public.key
+#  cat >wg0.conf << EOF
+#  [Interface]
+#  PrivateKey = $(cat private.key)
+#  Address = 10.11.12.2/24
+#  
+#  [Peer]
+#  PublicKey = $(cat server-public.key)
+#  AllowedIPs = 0.0.0.0/0, ::/0
+#  Endpoint = 1.2.3.4:53
+#  PersistentKeepalive = 15
+#  EOF
+
 # add the "client" peer on the endpoint with public IP:
-#  wg set wg0 peer base64publickeyclient allowed-ips 10.11.12.2/24
+# echo "base64client1publickey" > client1.key
+# cat >>wg0.conf << EOF
+# [Peer]
+# PublicKey = $(cat client1.key)
+# AllowedIPs = 10.11.12.2/32
+# EOF
+# wg-quick down wg0; wg-quick up wg0
 
 # on the AWS side, compare
 #  tcpdump -A -i eth0 port not ssh
